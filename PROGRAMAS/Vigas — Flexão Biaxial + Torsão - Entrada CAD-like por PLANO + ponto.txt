@@ -1,0 +1,957 @@
+import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIG
+# ============================================================
+st.set_page_config(
+    page_title="Vigas 3D — Flexão Biaxial + Torsão (CAD-like)",
+    layout="wide"
+)
+st.title("Vigas — Flexão Biaxial + Torsão | Entrada CAD-like por PLANO + ponto")
+
+# ============================================================
+# MATERIAIS (SI)
+# E (Pa), fy (Pa), nu (-)
+# ============================================================
+MATS = {
+    "aco_1020": {"E": 210e9, "fy": 350e6, "nu": 0.30},
+    "aco_1045": {"E": 210e9, "fy": 530e6, "nu": 0.29},
+    "aluminio": {"E": 70e9,  "fy": 250e6, "nu": 0.33},
+}
+
+# ============================================================
+# PERFIS - TABELA (exemplo - você pode ampliar)
+# Dimensões em mm na tabela
+# ============================================================
+PROFILE_TABLE = {
+    "RETANGULO": [
+        {"name": "Chapa 100 x 10", "b_mm": 100.0, "h_mm": 10.0},
+        {"name": "Chapa 200 x 6,35", "b_mm": 200.0, "h_mm": 6.35},
+    ],
+    "TUBO REDONDO": [
+        {"name": "Tubo Ø60,3 x 3,0", "OD_mm": 60.3, "t_mm": 3.0},
+        {"name": "Tubo Ø88,9 x 3,2", "OD_mm": 88.9, "t_mm": 3.2},
+        {"name": "Tubo Ø114,3 x 4,0", "OD_mm": 114.3, "t_mm": 4.0},
+    ],
+    "TUBO QUADRADO": [
+        {"name": "Tubo 50x50x3,0", "B_mm": 50.0, "H_mm": 50.0, "t_mm": 3.0},
+        {"name": "Tubo 80x80x3,0", "B_mm": 80.0, "H_mm": 80.0, "t_mm": 3.0},
+        {"name": "Tubo 100x100x4,0", "B_mm": 100.0, "H_mm": 100.0, "t_mm": 4.0},
+    ],
+    "VIGA I (GENERICA)": [
+        {"name": "I 200 (gen)", "h_mm": 200.0, "bf_mm": 100.0, "tw_mm": 6.0, "tf_mm": 8.0},
+        {"name": "I 300 (gen)", "h_mm": 300.0, "bf_mm": 150.0, "tw_mm": 7.0, "tf_mm": 10.0},
+    ],
+    "PERFIL U (GENERICO)": [
+        {"name": "U 200 (gen)", "h_mm": 200.0, "bf_mm": 75.0, "tw_mm": 6.0, "tf_mm": 8.0},
+        {"name": "U 250 (gen)", "h_mm": 250.0, "bf_mm": 80.0, "tw_mm": 6.5, "tf_mm": 9.0},
+    ],
+    "CANTONEIRA L (GENERICO)": [
+        {"name": "L 50x50x5", "b1_mm": 50.0, "b2_mm": 50.0, "t_mm": 5.0},
+        {"name": "L 80x50x6", "b1_mm": 80.0, "b2_mm": 50.0, "t_mm": 6.0},
+    ],
+}
+
+# ============================================================
+# UNIDADES (motor SI)
+# ============================================================
+def to_m(x, unit_len):     return x/1000.0 if unit_len == "mm" else x
+def from_m(x, unit_len):   return x*1000.0 if unit_len == "mm" else x
+def to_Pa(x, unit_stress): return x*1e6 if unit_stress == "MPa" else x
+def from_Pa(x, unit_stress): return x/1e6 if unit_stress == "MPa" else x
+
+# ============================================================
+# MECÂNICA: propriedades
+# ============================================================
+def shear_modulus(E, nu):
+    return E / (2.0*(1.0 + nu))
+
+def rect_Iy_Iz(b, h):
+    # y = largura, z = altura
+    Iy = (b*h**3)/12.0   # em torno de y => usa z^2
+    Iz = (h*b**3)/12.0   # em torno de z => usa y^2
+    return Iy, Iz
+
+def torsion_J_rect_solid(b, h):
+    # Aproximação clássica para retângulo sólido
+    a = min(b, h)
+    c = max(b, h)
+    r = a/c
+    return (a**3 * c) * (1/3.0 - 0.21*r*(1 - (r**4)/12.0))
+
+def torsion_J_circular_tube(OD, t):
+    Ro = OD/2.0
+    Ri = max(Ro - t, 0.0)
+    J = (np.pi/2.0)*(Ro**4 - Ri**4)
+    return J, Ro, Ri
+
+def torsion_J_rect_tube_closed_thin(B, H, t):
+    # Bredt (aprox), válido p/ tubo fino (t << dimensões)
+    bm = B - t
+    hm = H - t
+    if bm <= 0 or hm <= 0:
+        return None
+    A_m = bm*hm
+    per = 2*(bm+hm)
+    J = 4*(A_m**2) / (per/t)
+    return J, A_m
+
+def torsion_J_open_thinwall(segments):
+    # J aberto (aprox): Σ (1/3)*t^3*l
+    return sum((1/3.0)*s["t"]**3*s["l"] for s in segments)
+
+def section_from_rectangles(rects):
+    # rect: b (y), h (z), yc, zc
+    A = sum(r["b"]*r["h"] for r in rects)
+    yc = sum((r["b"]*r["h"])*r["yc"] for r in rects)/A
+    zc = sum((r["b"]*r["h"])*r["zc"] for r in rects)/A
+
+    Iy = 0.0
+    Iz = 0.0
+    ymin = 1e30; ymax = -1e30
+    zmin = 1e30; zmax = -1e30
+
+    for r in rects:
+        b, h = r["b"], r["h"]
+        Ai = b*h
+        Iy_i = (b*h**3)/12.0
+        Iz_i = (h*b**3)/12.0
+        dy = r["yc"] - yc
+        dz = r["zc"] - zc
+        Iy += Iy_i + Ai*dz**2
+        Iz += Iz_i + Ai*dy**2
+
+        ymin = min(ymin, r["yc"] - b/2)
+        ymax = max(ymax, r["yc"] + b/2)
+        zmin = min(zmin, r["zc"] - h/2)
+        zmax = max(zmax, r["zc"] + h/2)
+
+    return A, yc, zc, Iy, Iz, (ymin, ymax), (zmin, zmax)
+
+def composite_layers_equiv(b, layers, E_ref):
+    # camadas empilhadas em z (altura), largura b constante
+    z0 = 0.0
+    trans_rects = []
+    h_total = 0.0
+
+    for lay in layers:
+        t = lay["t"]
+        E = lay["E"]
+        n = E / E_ref
+        trans_rects.append({
+            "b": b*n,         # seção transformada
+            "h": t,
+            "yc": 0.0,
+            "zc": z0 + t/2
+        })
+        z0 += t
+        h_total += t
+
+    Aeq, yc, zc, Iy_eq, Iz_eq, yext, zext = section_from_rectangles(trans_rects)
+    return zc, Iy_eq, Iz_eq, yext, zext, h_total
+
+# ============================================================
+# FEM Euler-Bernoulli 1D
+# DOF por nó: [w, theta]
+# ============================================================
+def beam_element_k(EI, Le):
+    L = Le
+    return (EI / L**3) * np.array([
+        [ 12,   6*L, -12,   6*L],
+        [6*L, 4*L**2, -6*L, 2*L**2],
+        [-12, -6*L,  12,  -6*L],
+        [6*L, 2*L**2, -6*L, 4*L**2],
+    ], dtype=float)
+
+def apply_bc(K, F, fixed_dofs):
+    all_dofs = np.arange(K.shape[0])
+    fixed = np.array(sorted(set(fixed_dofs)), dtype=int)
+    free = np.setdiff1d(all_dofs, fixed)
+    return free, K[np.ix_(free, free)], F[free]
+
+def shape_N(Le, xi):
+    L = Le
+    N1 = 1 - 3*xi**2 + 2*xi**3
+    N2 = L*(xi - 2*xi**2 + xi**3)
+    N3 = 3*xi**2 - 2*xi**3
+    N4 = L*(-xi**2 + xi**3)
+    return np.array([N1, N2, N3, N4], dtype=float)
+
+def shape_dNdx(Le, xi):
+    # derivada das shape functions de w em relação a x
+    L = Le
+    dN1_dxi = (-6*xi + 6*xi**2)
+    dN2_dxi = (1 - 4*xi + 3*xi**2) * L
+    dN3_dxi = (6*xi - 6*xi**2)
+    dN4_dxi = (-2*xi + 3*xi**2) * L
+    # d/dx = (1/L)*d/dxi para termos sem L; cuidado: N2,N4 já têm L
+    # como N2,N4 têm L, a derivada acima já está em unidades coerentes; então:
+    dNdx = np.array([dN1_dxi/L, dN2_dxi/L, dN3_dxi/L, dN4_dxi/L], dtype=float)
+    return dNdx
+
+def gauss_points(n=3):
+    if n == 2:
+        return [(-1/np.sqrt(3), 1.0), (1/np.sqrt(3), 1.0)]
+    # 3 pontos
+    return [(-np.sqrt(3/5), 5/9), (0.0, 8/9), (np.sqrt(3/5), 5/9)]
+
+def equiv_nodal_load_distributed(Le, w_of_x_local, n_gauss=3):
+    # f_i = ∫ N_i(x) * w(x) dx  (carga para baixo/positivo conforme sinal)
+    # integra em xi de 0..1 usando transformação s ∈ [-1,1]
+    f = np.zeros(4, float)
+    gps = gauss_points(3 if n_gauss == 3 else 2)
+    for s, ws in gps:
+        xi = 0.5*(s + 1.0)     # 0..1
+        xloc = xi*Le
+        N = shape_N(Le, xi)
+        w = w_of_x_local(xloc)  # N/m (SI) ao longo do elemento
+        # dx = (Le/2) ds
+        f += N * w * (Le/2.0) * ws
+    return f
+
+def solve_beam_FEM(L, EI, apoio_esq, apoio_dir, loads, ne=160):
+    # loads: lista de dicts:
+    #  P: {"type":"P", "x":..., "P":...}
+    #  M: {"type":"M", "x":..., "M":...}  (momento aplicado na rotação)
+    #  wU: {"type":"wU", "a":..., "b":..., "w":...}
+    #  wL: {"type":"wL", "a":..., "b":..., "wa":..., "wb":...} (linear no trecho)
+    x_nodes = np.linspace(0.0, L, ne+1)
+    Le = L/ne
+    nn = ne+1
+    ndof = 2*nn
+
+    K = np.zeros((ndof, ndof), float)
+    F = np.zeros(ndof, float)
+
+    # Rigidez
+    for e in range(ne):
+        ke = beam_element_k(EI, Le)
+        dofs = np.array([2*e, 2*e+1, 2*(e+1), 2*(e+1)+1])
+        K[np.ix_(dofs, dofs)] += ke
+
+    # Cargas distribuídas (equivalentes por elemento)
+    for e in range(ne):
+        xa = x_nodes[e]
+        xb = x_nodes[e+1]
+        dofs = np.array([2*e, 2*e+1, 2*(e+1), 2*(e+1)+1])
+
+        # soma de todas as w's que pegam esse elemento (integração por Gauss)
+        def w_local(xloc):
+            xg = xa + xloc
+            wsum = 0.0
+            for ld in loads:
+                if ld["type"] == "wU":
+                    a, b, w = ld["a"], ld["b"], ld["w"]
+                    if xg >= a and xg <= b:
+                        wsum += w
+                elif ld["type"] == "wL":
+                    a, b = ld["a"], ld["b"]
+                    if xg >= a and xg <= b and (b-a) > 1e-12:
+                        wa, wb = ld["wa"], ld["wb"]
+                        r = (xg - a)/(b-a)
+                        wsum += wa + (wb-wa)*r
+            return wsum
+
+        fe = equiv_nodal_load_distributed(Le, w_local, n_gauss=3)
+        F[dofs] += fe
+
+    # Cargas concentradas (força e momento) via shape functions no elemento
+    for ld in loads:
+        if ld["type"] in ("P", "M"):
+            x = float(ld["x"])
+            # limita
+            x = min(max(x, 0.0), L)
+            e = min(int(np.floor(x/Le)), ne-1)
+            xa = x_nodes[e]
+            xi = (x - xa)/Le
+            dofs = np.array([2*e, 2*e+1, 2*(e+1), 2*(e+1)+1])
+
+            if ld["type"] == "P":
+                P = float(ld["P"])
+                N = shape_N(Le, xi)
+                # Work: P * δw(x) => f = P*N
+                F[dofs] += P * N
+
+            if ld["type"] == "M":
+                M = float(ld["M"])
+                # Work: M * δθ(x) ; θ = dw/dx => f = M * dNdx
+                dNdx = shape_dNdx(Le, xi)
+                F[dofs] += M * dNdx
+
+    # BC: opções (todas as condições usuais)
+    # - Engastado: w=0 e theta=0
+    # - Pino/Rolete: w=0
+    # - Guia: theta=0
+    # - Livre: nada
+    fixed = []
+    # esquerda (nó 0)
+    if apoio_esq == "Engastado":
+        fixed += [0, 1]
+    elif apoio_esq == "Pino/Roletado (w=0)":
+        fixed += [0]
+    elif apoio_esq == "Guia (θ=0)":
+        fixed += [1]
+
+    # direita (nó final)
+    last_w = 2*(nn-1)
+    last_t = last_w + 1
+    if apoio_dir == "Engastado":
+        fixed += [last_w, last_t]
+    elif apoio_dir == "Pino/Roletado (w=0)":
+        fixed += [last_w]
+    elif apoio_dir == "Guia (θ=0)":
+        fixed += [last_t]
+
+    free, Kff, Ff = apply_bc(K, F, fixed)
+    d = np.zeros(ndof, float)
+    if len(free) > 0:
+        d[free] = np.linalg.solve(Kff, Ff)
+
+    # pós: amostra w e estima V,M por elemento (forças internas)
+    xs = []
+    ws = []
+    Ms = []
+    Vs = []
+
+    def end_forces_element(EI, Le, d_e):
+        ke = beam_element_k(EI, Le)
+        # sem f_eq aqui (já foi aplicado no global), para diagramas conceituais:
+        return ke @ d_e
+
+    def shape_w(Le, xi, d_e):
+        N = shape_N(Le, xi)
+        return float(N @ d_e)
+
+    for e in range(ne):
+        dofs = np.array([2*e, 2*e+1, 2*(e+1), 2*(e+1)+1])
+        d_e = d[dofs]
+
+        f_int = end_forces_element(EI, Le, d_e)
+        # f_int = [V1, M1, V2, M2] (convenção do elemento)
+        V1, M1, V2, M2 = f_int
+
+        for xi in np.linspace(0, 1, 6, endpoint=False):
+            xg = x_nodes[e] + xi*Le
+            wg = shape_w(Le, xi, d_e)
+            xs.append(xg)
+            ws.append(wg)
+            Ms.append(M1*(1-xi) + M2*xi)
+            Vs.append(V1*(1-xi) + V2*xi)
+
+    xs.append(L)
+    ws.append(d[last_w])
+    Ms.append(Ms[-1] if len(Ms) else 0.0)
+    Vs.append(Vs[-1] if len(Vs) else 0.0)
+
+    return np.array(xs), np.array(ws), np.array(Vs), np.array(Ms)
+
+# ============================================================
+# TORSÃO: tensão máxima (aprox por tipo)
+# ============================================================
+def torsion_tau_max(profile_kind, T, torsion_props):
+    T = float(T)
+    if abs(T) < 1e-12:
+        return 0.0, "Sem torque."
+
+    if profile_kind == "TUBO REDONDO":
+        J = torsion_props["J"]
+        Ro = torsion_props["Ro"]
+        tau = abs(T) * Ro / J
+        return tau, "τmax ≈ T·Ro/J (anel circular)."
+
+    if profile_kind == "TUBO QUADRADO":
+        # Bredt (fechado, fino): tau ≈ T/(2*A_m*t)
+        A_m = torsion_props.get("A_m", None)
+        t = torsion_props.get("t", None)
+        if A_m is not None and t is not None and A_m > 0 and t > 0:
+            tau = abs(T) / (2.0*A_m*t)
+            return tau, "τ ≈ T/(2·A_m·t) (Bredt, tubo retangular fino)."
+        # fallback
+        J = torsion_props["J"]
+        r = max(torsion_props["B"], torsion_props["H"])/2.0
+        tau = abs(T)*r/max(J, 1e-18)
+        return tau, "Fallback τ via r/J."
+
+    if profile_kind == "RETANGULO":
+        J = torsion_props["J"]
+        r = max(torsion_props["b"], torsion_props["h"])/2.0
+        tau = abs(T)*r/max(J, 1e-18)
+        return tau, "Retângulo sólido: τ aprox com J e raio equivalente."
+
+    if profile_kind in ("VIGA I (GENERICA)", "PERFIL U (GENERICO)", "CANTONEIRA L (GENERICO)"):
+        Jopen = torsion_props["J_open"]
+        r = torsion_props["r_eq"]
+        tau = abs(T)*r/max(Jopen, 1e-18)
+        return tau, "Perfil aberto: aprox com J_aberto (sem warping/centro de cisalhamento)."
+
+    return 0.0, "Sem modelo de torsão para este tipo."
+
+# ============================================================
+# SIDEBAR: unidades
+# ============================================================
+with st.sidebar:
+    st.header("Unidades")
+    unit_system = st.selectbox("Sistema", ["SI (m, N, Pa)", "mm (mm, N, MPa)"], index=0)
+    unit_len = "m" if unit_system.startswith("SI") else "mm"
+    unit_stress = "Pa" if unit_system.startswith("SI") else "MPa"
+    st.caption("Motor interno sempre em SI. Toggle só muda entrada/saída.")
+
+# ============================================================
+# 1) GEOMETRIA / APOIOS / MATERIAL
+# ============================================================
+st.subheader("1) Geometria, apoios e material")
+
+c1, c2, c3, c4 = st.columns([1.1, 1.3, 1.3, 1.2])
+with c1:
+    L_in = st.number_input(f"Comprimento L ({unit_len})", min_value=0.001, value=2.0 if unit_len=="m" else 2000.0,
+                           step=0.1 if unit_len=="m" else 50.0)
+with c2:
+    apoio_esq = st.selectbox("Apoio esquerdo", ["Engastado", "Pino/Roletado (w=0)", "Guia (θ=0)", "Livre"], index=1)
+with c3:
+    apoio_dir = st.selectbox("Apoio direito", ["Engastado", "Pino/Roletado (w=0)", "Guia (θ=0)", "Livre"], index=1)
+with c4:
+    material = st.selectbox("Material", list(MATS.keys()), index=0)
+
+FS = st.number_input("Fator de Segurança (FS)", min_value=1.0, value=1.5, step=0.1)
+
+L = to_m(L_in, unit_len)
+E = MATS[material]["E"]
+fy = MATS[material]["fy"]
+nu = MATS[material]["nu"]
+G = shear_modulus(E, nu)
+
+# ============================================================
+# 2) SEÇÃO
+# ============================================================
+st.subheader("2) Seção transversal (Tabela / Custom / Composta)")
+
+sec_mode = st.radio("Modo", ["Tabela de perfis", "Custom", "Seção composta (camadas)"], horizontal=True)
+
+profile_kind = None
+torsion_props = {}
+yc = 0.0; zc = 0.0
+
+Iy = 0.0
+Iz = 0.0
+A  = 0.0
+yext = (-0.0, 0.0)
+zext = (-0.0, 0.0)
+
+if sec_mode == "Tabela de perfis":
+    profile_kind = st.selectbox("Família", list(PROFILE_TABLE.keys()), index=0)
+    sel = st.selectbox("Perfil", [p["name"] for p in PROFILE_TABLE[profile_kind]], index=0)
+    row = next(p for p in PROFILE_TABLE[profile_kind] if p["name"] == sel)
+
+    if profile_kind == "RETANGULO":
+        b = row["b_mm"]/1000.0
+        h = row["h_mm"]/1000.0
+        A = b*h
+        Iy, Iz = rect_Iy_Iz(b, h)
+        J = torsion_J_rect_solid(b, h)
+        yext = (-b/2, b/2); zext = (-h/2, h/2)
+        torsion_props = {"J": J, "b": b, "h": h}
+
+    elif profile_kind == "TUBO REDONDO":
+        OD = row["OD_mm"]/1000.0
+        t  = row["t_mm"]/1000.0
+        J, Ro, Ri = torsion_J_circular_tube(OD, t)
+        A = np.pi*(Ro**2 - Ri**2)
+        Iy = Iz = (np.pi/4.0)*(Ro**4 - Ri**4)
+        yext = (-Ro, Ro); zext = (-Ro, Ro)
+        torsion_props = {"J": J, "Ro": Ro, "Ri": Ri}
+
+    elif profile_kind == "TUBO QUADRADO":
+        B = row["B_mm"]/1000.0
+        H = row["H_mm"]/1000.0
+        t = row["t_mm"]/1000.0
+        Iy_out, Iz_out = rect_Iy_Iz(B, H)
+        Bi = max(B - 2*t, 0.0)
+        Hi = max(H - 2*t, 0.0)
+        Iy_in, Iz_in = rect_Iy_Iz(Bi, Hi) if (Bi>0 and Hi>0) else (0.0, 0.0)
+        Iy = Iy_out - Iy_in
+        Iz = Iz_out - Iz_in
+        A = B*H - Bi*Hi
+        Jinfo = torsion_J_rect_tube_closed_thin(B, H, t)
+        if Jinfo is None:
+            J = 1e-18
+            A_m = None
+        else:
+            J, A_m = Jinfo
+        yext = (-B/2, B/2); zext = (-H/2, H/2)
+        torsion_props = {"J": J, "B": B, "H": H, "t": t, "A_m": A_m}
+
+    elif profile_kind == "VIGA I (GENERICA)":
+        h = row["h_mm"]/1000.0
+        bf = row["bf_mm"]/1000.0
+        tw = row["tw_mm"]/1000.0
+        tf = row["tf_mm"]/1000.0
+
+        rects = [
+            {"b": bf, "h": tf, "yc": 0.0, "zc": +(h/2 - tf/2)},
+            {"b": bf, "h": tf, "yc": 0.0, "zc": -(h/2 - tf/2)},
+            {"b": tw, "h": (h-2*tf), "yc": 0.0, "zc": 0.0},
+        ]
+        A, yc, zc, Iy, Iz, yext, zext = section_from_rectangles(rects)
+        segs = [{"l": bf, "t": tf}, {"l": bf, "t": tf}, {"l": (h-2*tf), "t": tw}]
+        J_open = torsion_J_open_thinwall(segs)
+        torsion_props = {"J_open": J_open, "r_eq": max(bf, h)/2.0}
+
+    elif profile_kind == "PERFIL U (GENERICO)":
+        h = row["h_mm"]/1000.0
+        bf = row["bf_mm"]/1000.0
+        tw = row["tw_mm"]/1000.0
+        tf = row["tf_mm"]/1000.0
+
+        rects = [
+            {"b": bf, "h": tf, "yc": +(tw/2 + bf/2), "zc": +(h/2 - tf/2)},
+            {"b": bf, "h": tf, "yc": +(tw/2 + bf/2), "zc": -(h/2 - tf/2)},
+            {"b": tw, "h": (h-2*tf), "yc": 0.0, "zc": 0.0},
+        ]
+        A, yc, zc, Iy, Iz, yext, zext = section_from_rectangles(rects)
+        segs = [{"l": bf, "t": tf}, {"l": bf, "t": tf}, {"l": (h-2*tf), "t": tw}]
+        J_open = torsion_J_open_thinwall(segs)
+        torsion_props = {"J_open": J_open, "r_eq": max(bf, h)/2.0}
+
+    elif profile_kind == "CANTONEIRA L (GENERICO)":
+        b1 = row["b1_mm"]/1000.0
+        b2 = row["b2_mm"]/1000.0
+        t  = row["t_mm"]/1000.0
+
+        # aproximação por retângulos (L simples)
+        rects = [
+            {"b": b1, "h": t,  "yc": +(b1/2), "zc": +(t/2)},
+            {"b": t,  "h": b2, "yc": +(t/2),  "zc": +(b2/2)},
+        ]
+        A, yc, zc, Iy, Iz, yext, zext = section_from_rectangles(rects)
+        segs = [{"l": b1, "t": t}, {"l": b2, "t": t}]
+        J_open = torsion_J_open_thinwall(segs)
+        torsion_props = {"J_open": J_open, "r_eq": max(b1, b2)/2.0}
+
+else:
+    profile_kind = st.selectbox("Família", ["RETANGULO", "TUBO REDONDO", "TUBO QUADRADO"], index=0)
+
+    if sec_mode == "Custom":
+        if profile_kind == "RETANGULO":
+            b_in = st.number_input(f"Largura b ({unit_len})", min_value=0.001, value=0.10 if unit_len=="m" else 100.0)
+            h_in = st.number_input(f"Altura  h ({unit_len})", min_value=0.001, value=0.010 if unit_len=="m" else 10.0)
+            b = to_m(b_in, unit_len)
+            h = to_m(h_in, unit_len)
+            A = b*h
+            Iy, Iz = rect_Iy_Iz(b, h)
+            J = torsion_J_rect_solid(b, h)
+            yext = (-b/2, b/2); zext = (-h/2, h/2)
+            torsion_props = {"J": J, "b": b, "h": h}
+
+        elif profile_kind == "TUBO REDONDO":
+            OD_in = st.number_input(f"Diâmetro externo OD ({unit_len})", min_value=0.001, value=0.0603 if unit_len=="m" else 60.3)
+            t_in  = st.number_input(f"Espessura t ({unit_len})", min_value=0.0005, value=0.003 if unit_len=="m" else 3.0)
+            OD = to_m(OD_in, unit_len)
+            t  = to_m(t_in, unit_len)
+            J, Ro, Ri = torsion_J_circular_tube(OD, t)
+            A = np.pi*(Ro**2 - Ri**2)
+            Iy = Iz = (np.pi/4.0)*(Ro**4 - Ri**4)
+            yext = (-Ro, Ro); zext = (-Ro, Ro)
+            torsion_props = {"J": J, "Ro": Ro, "Ri": Ri}
+
+        elif profile_kind == "TUBO QUADRADO":
+            B_in = st.number_input(f"Lado B ({unit_len})", min_value=0.001, value=0.10 if unit_len=="m" else 100.0)
+            H_in = st.number_input(f"Lado H ({unit_len})", min_value=0.001, value=0.10 if unit_len=="m" else 100.0)
+            t_in = st.number_input(f"Espessura t ({unit_len})", min_value=0.0005, value=0.004 if unit_len=="m" else 4.0)
+            B = to_m(B_in, unit_len)
+            H = to_m(H_in, unit_len)
+            t = to_m(t_in, unit_len)
+            Iy_out, Iz_out = rect_Iy_Iz(B, H)
+            Bi = max(B - 2*t, 0.0)
+            Hi = max(H - 2*t, 0.0)
+            Iy_in, Iz_in = rect_Iy_Iz(Bi, Hi) if (Bi>0 and Hi>0) else (0.0,0.0)
+            Iy = Iy_out - Iy_in
+            Iz = Iz_out - Iz_in
+            A = B*H - Bi*Hi
+            Jinfo = torsion_J_rect_tube_closed_thin(B, H, t)
+            if Jinfo is None:
+                J = 1e-18
+                A_m = None
+            else:
+                J, A_m = Jinfo
+            yext = (-B/2, B/2); zext = (-H/2, H/2)
+            torsion_props = {"J": J, "B": B, "H": H, "t": t, "A_m": A_m}
+
+    else:
+        # Seção composta em camadas retangulares (empilhadas em z)
+        st.caption("Camadas empilhadas na altura (z). Largura constante. Seção transformada por E.")
+        b_in = st.number_input(f"Largura b ({unit_len})", min_value=0.001, value=0.20 if unit_len=="m" else 200.0)
+        b = to_m(b_in, unit_len)
+
+        n_layers = st.number_input("Qtd de camadas", min_value=2, max_value=6, value=2, step=1)
+
+        layers = []
+        for i in range(int(n_layers)):
+            cA, cB = st.columns(2)
+            with cA:
+                t_default = 0.00635 if (unit_len=="m" and i==0) else 0.003 if (unit_len=="m" and i==1) else 6.35 if (unit_len=="mm" and i==0) else 3.0
+                t_in = st.number_input(f"Camada {i+1} espessura ({unit_len})", min_value=0.0005, value=t_default, key=f"t{i}")
+            with cB:
+                mat_i = st.selectbox(f"Camada {i+1} material", list(MATS.keys()), index=0, key=f"m{i}")
+            layers.append({"t": to_m(t_in, unit_len), "E": MATS[mat_i]["E"]})
+
+        E_ref = layers[0]["E"]
+        zbar, Iy, Iz, yext, zext, htot = composite_layers_equiv(b, layers, E_ref)
+        A = b*htot
+        J = torsion_J_rect_solid(b, htot)
+        torsion_props = {"J": J, "b": b, "h": htot}
+
+        st.info(
+            f"Eixo neutro z̄ (a partir da base): {from_m(zbar, unit_len):.4f} {unit_len} | "
+            f"Iy_eq={Iy:.3e} m⁴ | Iz_eq={Iz:.3e} m⁴ | h_total={from_m(htot, unit_len):.3f} {unit_len}"
+        )
+
+EIy = E*Iy
+EIz = E*Iz
+
+# ============================================================
+# 3) CARGAS (CAD-LIKE)
+# ============================================================
+st.subheader("3) Carregamentos — CAD-like (PLANO + ponto no plano) + momentos/torque + distribuídas")
+
+if "loads" not in st.session_state:
+    st.session_state.loads = []
+
+def add_load(ld):
+    st.session_state.loads.append(ld)
+
+def torque_from_point_force(y, z, Fy, Fz):
+    # T_x = y*Fz - z*Fy
+    return y*Fz - z*Fy
+
+left, mid, right = st.columns([1.2, 1.4, 1.4])
+
+with left:
+    kind = st.selectbox("Tipo", [
+        "Força (por plano)",
+        "Momento concentrado (My/Mz)",
+        "Torque concentrado (Tx)",
+        "Distribuída uniforme (trecho)",
+        "Distribuída linear (trecho)"
+    ])
+
+with mid:
+    x_in = st.number_input(f"Posição ao longo: x ({unit_len})", min_value=0.0, max_value=float(L_in), value=float(L_in)/2)
+    x = to_m(x_in, unit_len)
+
+with right:
+    st.caption("Regra: você escolhe PLANO + ponto no plano. O app converte internamente.")
+
+Fy=Fz=0.0
+My=Mz=0.0
+Tx=0.0
+
+if kind == "Força (por plano)":
+    plano = st.selectbox("Plano CAD", ["Superior (X–Y)", "Frontal (X–Z)", "Direito (Y–Z / Seção)"])
+
+    # Coordenadas no plano (o usuário pensa em CAD)
+    y = 0.0
+    z = 0.0
+
+    mag = st.number_input("Magnitude |F| (N)", value=1000.0, step=100.0)
+    sinal = st.selectbox("Sentido", ["+", "-"])
+    s = 1.0 if sinal == "+" else -1.0
+    mag = s*mag
+
+    if plano == "Superior (X–Y)":
+        y_in = st.number_input(f"Coordenada no plano: y ({unit_len})", value=0.0)
+        y = to_m(y_in, unit_len)
+        z = 0.0
+        direcao = st.selectbox("Direção no plano escolhido", ["Normal ao plano (±Z)", "No plano (±Y)"])
+        if direcao == "Normal ao plano (±Z)":
+            Fz = mag
+            Fy = 0.0
+        else:
+            Fy = mag
+            Fz = 0.0
+
+    elif plano == "Frontal (X–Z)":
+        z_in = st.number_input(f"Coordenada no plano: z ({unit_len})", value=0.0)
+        z = to_m(z_in, unit_len)
+        y = 0.0
+        direcao = st.selectbox("Direção no plano escolhido", ["Normal ao plano (±Y)", "No plano (±Z)"])
+        if direcao == "Normal ao plano (±Y)":
+            Fy = mag
+            Fz = 0.0
+        else:
+            Fz = mag
+            Fy = 0.0
+
+    else:  # Direito (Y–Z)
+        y_in = st.number_input(f"Coordenada no plano: y ({unit_len})", value=0.0)
+        z_in = st.number_input(f"Coordenada no plano: z ({unit_len})", value=0.0)
+        y = to_m(y_in, unit_len)
+        z = to_m(z_in, unit_len)
+        direcao = st.selectbox("Direção", ["Em +Y/-Y", "Em +Z/-Z"])
+        if direcao == "Em +Y/-Y":
+            Fy = mag
+            Fz = 0.0
+        else:
+            Fz = mag
+            Fy = 0.0
+
+    Tx = torque_from_point_force(y, z, Fy, Fz)
+
+    show_conv = st.checkbox("Mostrar conversão (Fy/Fz/Tx)", value=True)
+    if show_conv:
+        st.write(f"Fy = {Fy:.3f} N | Fz = {Fz:.3f} N | Tx = {Tx:.3f} N·m")
+
+    if st.button("Adicionar força"):
+        add_load({
+            "kind": "P",
+            "x": x,
+            "Fy": Fy, "Fz": Fz,
+            "Tx": Tx,
+            "meta": {"plano": plano, "x": x_in}
+        })
+        st.success("Força adicionada.")
+
+elif kind == "Momento concentrado (My/Mz)":
+    My = st.number_input("My (N·m) (momento em torno de Y)", value=0.0, step=50.0)
+    Mz = st.number_input("Mz (N·m) (momento em torno de Z)", value=0.0, step=50.0)
+    if st.button("Adicionar momento"):
+        add_load({"kind":"M", "x": x, "My": float(My), "Mz": float(Mz), "Tx": 0.0, "meta": {"x": x_in}})
+        st.success("Momento adicionado.")
+
+elif kind == "Torque concentrado (Tx)":
+    Tx = st.number_input("Tx (N·m)", value=0.0, step=50.0)
+    if st.button("Adicionar torque"):
+        add_load({"kind":"T", "x": x, "Tx": float(Tx), "meta": {"x": x_in}})
+        st.success("Torque adicionado.")
+
+elif kind == "Distribuída uniforme (trecho)":
+    a_in = st.number_input(f"Início a ({unit_len})", value=0.0)
+    b_in = st.number_input(f"Fim b ({unit_len})", value=float(L_in))
+    direcao = st.selectbox("Direção", ["Em Y (wy)", "Em Z (wz)"])
+    w = st.number_input("Intensidade w (N/m)", value=-500.0, step=50.0)
+
+    a = to_m(min(a_in, b_in), unit_len)
+    btr = to_m(max(a_in, b_in), unit_len)
+
+    if st.button("Adicionar distribuída uniforme"):
+        add_load({"kind":"wU", "a": a, "b": btr, "wy": float(w) if direcao=="Em Y (wy)" else 0.0,
+                  "wz": float(w) if direcao=="Em Z (wz)" else 0.0, "meta": {"a": a_in, "b": b_in}})
+        st.success("Distribuída uniforme adicionada.")
+
+elif kind == "Distribuída linear (trecho)":
+    a_in = st.number_input(f"Início a ({unit_len})", value=0.0)
+    b_in = st.number_input(f"Fim b ({unit_len})", value=float(L_in))
+    direcao = st.selectbox("Direção", ["Em Y (wy)", "Em Z (wz)"])
+    wa = st.number_input("w(a) (N/m)", value=0.0, step=50.0)
+    wb = st.number_input("w(b) (N/m)", value=-500.0, step=50.0)
+
+    a = to_m(min(a_in, b_in), unit_len)
+    btr = to_m(max(a_in, b_in), unit_len)
+
+    if st.button("Adicionar distribuída linear"):
+        add_load({"kind":"wL", "a": a, "b": btr,
+                  "wy_a": float(wa) if direcao=="Em Y (wy)" else 0.0,
+                  "wy_b": float(wb) if direcao=="Em Y (wy)" else 0.0,
+                  "wz_a": float(wa) if direcao=="Em Z (wz)" else 0.0,
+                  "wz_b": float(wb) if direcao=="Em Z (wz)" else 0.0,
+                  "meta": {"a": a_in, "b": b_in}})
+        st.success("Distribuída linear adicionada.")
+
+st.markdown("### Cargas cadastradas")
+if st.session_state.loads:
+    st.dataframe(st.session_state.loads, width="stretch")
+else:
+    st.info("Nenhuma carga cadastrada.")
+
+cA, cB = st.columns([1,1])
+with cA:
+    if st.button("Limpar todas as cargas"):
+        st.session_state.loads = []
+        st.success("Cargas limpas.")
+with cB:
+    st.caption("Dica: cadastre várias cargas e só depois clique em CALCULAR.")
+
+# ============================================================
+# 4) CRITÉRIOS
+# ============================================================
+st.subheader("4) Critérios de validação")
+lim = st.selectbox("Limite de flecha", ["L/200", "L/250", "L/300", "L/400"], index=2)
+den = {"L/200":200, "L/250":250, "L/300":300, "L/400":400}[lim]
+delta_adm = L/den
+st.caption("Validações: flecha (limite) + tensão equivalente (Von Mises) <= fy/FS")
+
+# ============================================================
+# 5) CALCULAR
+# ============================================================
+if st.button("CALCULAR", type="primary"):
+
+    if Iy <= 0 or Iz <= 0:
+        st.error("Seção inválida: Iy ou Iz ≈ 0. Verifique dimensões.")
+        st.stop()
+
+    # Converter cargas cadastradas para loads_y e loads_z do solver 1D
+    # Convenção:
+    # - Solver do plano y: w_y responde a Fy e Mz
+    # - Solver do plano z: w_z responde a Fz e My
+    loads_y = []
+    loads_z = []
+    T_total = 0.0
+
+    for ld in st.session_state.loads:
+        if ld["kind"] == "P":
+            # Força concentrada
+            if abs(ld.get("Fy", 0.0)) > 0:
+                loads_y.append({"type":"P", "x": ld["x"], "P": ld["Fy"]})
+            if abs(ld.get("Fz", 0.0)) > 0:
+                loads_z.append({"type":"P", "x": ld["x"], "P": ld["Fz"]})
+            T_total += float(ld.get("Tx", 0.0))
+
+        elif ld["kind"] == "M":
+            # Momento concentrado
+            # My afeta plano z  (entra no solver z como M)
+            # Mz afeta plano y  (entra no solver y como M)
+            if abs(ld.get("Mz", 0.0)) > 0:
+                loads_y.append({"type":"M", "x": ld["x"], "M": ld["Mz"]})
+            if abs(ld.get("My", 0.0)) > 0:
+                loads_z.append({"type":"M", "x": ld["x"], "M": ld["My"]})
+
+        elif ld["kind"] == "T":
+            T_total += float(ld.get("Tx", 0.0))
+
+        elif ld["kind"] == "wU":
+            # distribuída uniforme
+            wy = float(ld.get("wy", 0.0))
+            wz = float(ld.get("wz", 0.0))
+            a = float(ld["a"]); btr = float(ld["b"])
+            if abs(wy) > 0:
+                loads_y.append({"type":"wU", "a": a, "b": btr, "w": wy})
+            if abs(wz) > 0:
+                loads_z.append({"type":"wU", "a": a, "b": btr, "w": wz})
+
+        elif ld["kind"] == "wL":
+            # distribuída linear
+            a = float(ld["a"]); btr = float(ld["b"])
+            wy_a = float(ld.get("wy_a", 0.0)); wy_b = float(ld.get("wy_b", 0.0))
+            wz_a = float(ld.get("wz_a", 0.0)); wz_b = float(ld.get("wz_b", 0.0))
+            if abs(wy_a) > 0 or abs(wy_b) > 0:
+                loads_y.append({"type":"wL", "a": a, "b": btr, "wa": wy_a, "wb": wy_b})
+            if abs(wz_a) > 0 or abs(wz_b) > 0:
+                loads_z.append({"type":"wL", "a": a, "b": btr, "wa": wz_a, "wb": wz_b})
+
+    # Resolver
+    xs, wy_x, Vy, Mz_x = solve_beam_FEM(L, EIz, apoio_esq, apoio_dir, loads_y)
+    xs2, wz_x, Vz, My_x = solve_beam_FEM(L, EIy, apoio_esq, apoio_dir, loads_z)
+
+    # Resultante
+    w_res = np.sqrt(wy_x**2 + wz_x**2)
+    delta_max = float(np.max(np.abs(w_res)))
+
+    # Momentos máximos
+    My_max = float(np.max(np.abs(My_x)))
+    Mz_max = float(np.max(np.abs(Mz_x)))
+
+    # Tensões normais biaxiais (aprox) nos extremos (retângulo envolvente)
+    ymin, ymax = yext
+    zmin, zmax = zext
+    corners = [(ymin,zmin),(ymin,zmax),(ymax,zmin),(ymax,zmax)]
+
+    def sigma_at(y, z, My, Mz):
+        s = 0.0
+        if abs(Iz) > 1e-18:
+            s += (Mz * y) / Iz
+        if abs(Iy) > 1e-18:
+            s += (My * z) / Iy
+        return s
+
+    sigmas = [sigma_at(y, z, My_max, Mz_max) for (y,z) in corners]
+    sigma_max = float(np.max(np.abs(sigmas)))
+
+    # Torsão -> tau_max (aprox)
+    tau_max, torsion_note = torsion_tau_max(profile_kind, T_total, torsion_props)
+
+    # Von Mises
+    sigma_vm = float(np.sqrt(sigma_max**2 + 3.0*(tau_max**2)))
+
+    sigma_adm = fy/FS
+    ok_sigma = sigma_vm <= sigma_adm
+    ok_defl = delta_max <= delta_adm
+
+    # ========================================================
+    # RESULTADOS
+    # ========================================================
+    st.subheader("Resultados")
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("δmax", f"{from_m(delta_max, unit_len):.6f} {unit_len}")
+        st.caption(f"Limite {lim}: {from_m(delta_adm, unit_len):.6f} {unit_len}")
+    with col2:
+        st.metric("My,max", f"{My_max:.3f} N·m")
+        st.metric("Mz,max", f"{Mz_max:.3f} N·m")
+    with col3:
+        st.metric("σmax (biaxial)", f"{from_Pa(sigma_max, unit_stress):.3f} {unit_stress}")
+        st.metric("τmax (torsão)", f"{from_Pa(tau_max, unit_stress):.3f} {unit_stress}")
+    with col4:
+        st.metric("σVM", f"{from_Pa(sigma_vm, unit_stress):.3f} {unit_stress}")
+        st.caption(f"σadm = fy/FS = {from_Pa(sigma_adm, unit_stress):.3f} {unit_stress}")
+
+    st.info(f"T_total = {T_total:.3f} N·m | {torsion_note}")
+
+    if ok_sigma and ok_defl:
+        st.success("✅ ELEMENTO VALIDADO (tensão + flecha OK)")
+    else:
+        falhas = []
+        if not ok_sigma: falhas.append("tensão (Von Mises)")
+        if not ok_defl: falhas.append("flecha")
+        st.error(f"❌ ELEMENTO NÃO VALIDADO (falhou em: {', '.join(falhas)})")
+
+    # ========================================================
+    # GRÁFICOS
+    # ========================================================
+    st.subheader("Diagramas e deformadas (SI interno)")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        fig, ax = plt.subplots()
+        ax.plot(xs, Vy, label="V_y(x)")
+        ax.plot(xs, Vz, label="V_z(x)")
+        ax.set_title("Cortantes")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("V (N)")
+        ax.grid(True)
+        ax.legend()
+        st.pyplot(fig)
+
+    with g2:
+        fig, ax = plt.subplots()
+        ax.plot(xs, Mz_x, label="Mz(x)")
+        ax.plot(xs, My_x, label="My(x)")
+        ax.set_title("Momentos fletores")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("M (N·m)")
+        ax.grid(True)
+        ax.legend()
+        st.pyplot(fig)
+
+    g3, g4 = st.columns(2)
+    with g3:
+        fig, ax = plt.subplots()
+        ax.plot(xs, wy_x, label="w_y(x)")
+        ax.plot(xs, wz_x, label="w_z(x)")
+        ax.set_title("Deformadas por plano")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("w (m)")
+        ax.grid(True)
+        ax.legend()
+        st.pyplot(fig)
+
+    with g4:
+        fig, ax = plt.subplots()
+        ax.plot(xs, w_res, label="w_resultante(x)", linewidth=2)
+        ax.set_title("Deformada resultante")
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel("w (m)")
+        ax.grid(True)
+        ax.legend()
+        st.pyplot(fig)
