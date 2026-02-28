@@ -15,6 +15,11 @@ def check_password():
         st.stop()
 
 check_password()
+st.set_page_config(
+    page_title="Calculadora de Flexão | Engenharia Estrutural",
+    page_icon="📐",
+    layout="wide"
+)
 import streamlit as st
 import numpy as np
 import pandas as pd
