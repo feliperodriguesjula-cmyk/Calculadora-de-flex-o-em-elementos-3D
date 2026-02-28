@@ -9,7 +9,7 @@ def check_password():
         if st.button("Entrar"):
             if password == st.secrets["APP_PASSWORD"]:
                 st.session_state.authenticated = True
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Senha incorreta.")
         st.stop()
