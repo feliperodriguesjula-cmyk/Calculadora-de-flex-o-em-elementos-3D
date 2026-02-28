@@ -1,4 +1,21 @@
 import streamlit as st
+
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        password = st.text_input("Digite a senha para acessar o app:", type="password")
+        if st.button("Entrar"):
+            if password == st.secrets["APP_PASSWORD"]:
+                st.session_state.authenticated = True
+                st.experimental_rerun()
+            else:
+                st.error("Senha incorreta.")
+        st.stop()
+
+check_password()
+import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
